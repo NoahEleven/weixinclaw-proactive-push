@@ -7,29 +7,33 @@
  *
  * 协议严格对齐腾讯官方插件 @tencent-weixin/openclaw-weixin@2.4.6（src/cdn + src/messaging + src/api）。
  *
- * 【关键机制：context_token（实测结论，2026-07-08 修正）】
- *   - 经实测：文本 / 图片 / 文件 / 视频 的主动推送，服务端【均】强制要求有效 context_token。
- *     传空串或省略该字段 => 统一返回 ret:-2 拒收（并非只有媒体才需要）。
- *   - 之前 17:37 文本/.txt 能收到，是因为彼时老板刚在对话、处于服务器宽松窗口；
- *     长时间无交互后空 token 即被拒（ret:-2）。
- *   - 有效 context_token 只在「老板给 bot 发过消息」后由服务端随 getUpdates 下发；
- *     本脚本通过 getUpdates 长轮询捕获并持久化到
- *     ~/.workbuddy/claw-state/weixin/context-token.json，文本与媒体推送前都会先解析它
- *     （--context > 已存文件 > 实时捕获）。token 可复用，长期未交互过期后重新捕获即可。
- *   - 结论：真正的「零前提主动推送」在 ilink bot 协议下不可行，必须先有老板的一次入站消息做 bootstrap。
+ * 【隐私说明】
+ *   - 本脚本只读本机两处文件，不向任何文件写出凭据：
+ *       ~/.workbuddy/settings.json                  （botToken / userId）
+ *       ~/.workbuddy/claw-state/weixin/<accountId>_im.bot.cursor.json （get_updates_buf 当 context_token）
+ *   - 日志只打印 token 长度（ctx_len），【绝不】打印 token 明文 / botToken / userId。
+ *   - 所有凭据均从本机配置文件现读，不依赖任何硬编码或外部传入的密钥。
+ *   - ⚠️ claw-state/weixin/ 的 cursor 文件内嵌 bot 凭证镜像，切勿将其纳入分享 / 备份 / 提交。
+ *
+ * 【context_token 来源（2026-07-09 定稿）】
+ *   - 唯一正确来源：claw-state/weixin 下最新的 <accountId>_im.bot.cursor.json 的
+ *     get_updates_buf（base64 protobuf，≈1 天有效，整段原样当 context_token 用）。
+ *   - ❌ 不采用「空 context_token」：它仅在你刚发过消息后的极短窗口才被放行，不够通用，已弃用。
+ *   - 全程不依赖 codebuddy.js 注入、不读 context-token.json。
  *
  * 用法:
- *   node send.js "文本消息"                                  # 主动推文本（空 token 即可）
+ *   node send.js "文本消息"                                  # 主动推文本（自动用 cursor buf 当 ctx）
  *   node send.js --text-file 内容.txt
- *   node send.js --image 截图.png --caption "看这张图"       # 需有效 context_token
+ *   node send.js --image 截图.png --caption "看这张图"
  *   node send.js --file 报告.pdf --name "周报.pdf" --caption "请查阅"
  *   node send.js --video clip.mp4
- *   node send.js "回复" --context <token>                    # 显式指定 token（回复场景）
- *   node send.js --capture-token                            # 常驻守护：持续监听老板消息，自动捕获并保存 context_token（永不退出，建议后台运行）
+ *   node send.js "回复" --context <token>                    # 手动指定 context_token 覆盖
  *   node send.js --verbose ...                              # 打印每步服务端响应
  *
  * 依赖: 仅 Node 内置 fetch / crypto / fs（Node 18+，推荐 managed node 22）。
  */
+
+'use strict';
 
 const fs = require('fs');
 const os = require('os');
@@ -37,8 +41,8 @@ const path = require('path');
 const crypto = require('crypto');
 
 const SETTINGS_PATH = path.join(os.homedir(), '.workbuddy', 'settings.json');
+const CLAW_STATE_DIR = path.join(os.homedir(), '.workbuddy', 'claw-state', 'weixin');
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
-const TOKEN_FILE = path.join(os.homedir(), '.workbuddy', 'claw-state', 'weixin', 'context-token.json');
 
 // ── 官方对齐常量（来自 @tencent-weixin/openclaw-weixin@2.4.6）────────────
 const ILINK_APP_ID = 'bot';                       // package.json ilink_appid
@@ -57,12 +61,13 @@ const DEFAULT_TEXT =
   '🦐 ClawBot 微信主动推送测试：如果你在微信里单独收到这条 bot 消息（不是和我的对话气泡），说明主动推送已打通。';
 
 let VERBOSE = false;
-function log(...a) { if (VERBOSE) console.error('[dbg]', ...a); }
+// ⚠️ 仅打印调试信息，绝不打印任何 token 明文（只包含长度等非敏感字段）
+function dbg(...a) { if (VERBOSE) console.error('[dbg]', ...a); }
 
-// ── 参数解析 ──────────────────────────────────────────────
+// ── 参数解析 ─────────────────────────────────────────────
 function parseArgs(argv) {
   const a = { text: null, textFile: null, image: null, file: null, video: null,
-              caption: null, name: null, context: '', verbose: false, captureToken: false };
+               caption: null, name: null, context: '', verbose: false };
   for (let i = 2; i < argv.length; i++) {
     const t = argv[i];
     if (t === '--text-file') a.textFile = argv[++i];
@@ -72,9 +77,8 @@ function parseArgs(argv) {
     else if (t === '--caption') a.caption = argv[++i];
     else if (t === '--name') a.name = argv[++i];
     else if (t === '--context' || t === '--ctx') a.context = argv[++i] || '';
-    else if (t === '--capture-token') a.captureToken = true;
     else if (t === '--verbose' || t === '-v') a.verbose = true;
-    else if (t.startsWith('--')) { /* 忽略未知 */ }
+    else if (t.startsWith('--')) { /* 忽略未知选项 */ }
     else if (a.text === null) a.text = t;
   }
   return a;
@@ -86,9 +90,9 @@ function randomWechatUin() {
 }
 function uuid16() { return crypto.randomUUID().replace(/-/g, '').slice(0, 16); }
 function aesEcbEncrypt(data, key) {
-  return Buffer.concat([crypto.createCipheriv('aes-128-ecb', key, null).update(data), crypto.createCipheriv('aes-128-ecb', key, null).final()]);
+  const c = crypto.createCipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([c.update(data), c.final()]);
 }
-function aesEcbPaddedSize(n) { return Math.ceil((n + 1) / 16) * 16; }
 function md5Hex(buf) { return crypto.createHash('md5').update(buf).digest('hex'); }
 function buildHeaders(token) {
   return {
@@ -108,21 +112,6 @@ function chunkText(s, size) {
   return out;
 }
 
-// ── context_token 持久化 ─────────────────────────────────
-function loadContextToken() {
-  try {
-    const j = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf-8'));
-    return j.context_token || null;
-  } catch { return null; }
-}
-function saveContextToken(tok) {
-  try {
-    fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ context_token: tok, saved_at: new Date().toISOString() }, null, 2));
-    log('saved context_token ->', TOKEN_FILE);
-  } catch (e) { log('saveContextToken failed', e.message); }
-}
-
 // ── 定位通道 ─────────────────────────────────────────────
 function findWeixinClawBot(cfg) {
   const users = cfg && cfg.claw && cfg.claw.users;
@@ -140,10 +129,32 @@ function findWeixinClawBot(cfg) {
   throw new Error('weixinClawBot channel not found in settings.json');
 }
 
+// ── 读取 context_token ──────────────────────────────────
+// 默认来源：claw-state/weixin 下最新的 <accountId>_im.bot.cursor.json
+// 的 get_updates_buf（ilink 接收长轮询游标，原始 base64 串，本身就是合法 context_token）。
+// ⚠️ 该文件内含 bot 凭证镜像，本函数只读取、绝不写出，日志只打印长度。
+function loadContextToken() {
+  try {
+    if (!fs.existsSync(CLAW_STATE_DIR)) { dbg('loadContextToken: 目录不存在'); return ''; }
+    const files = fs.readdirSync(CLAW_STATE_DIR).filter((f) => f.endsWith('_im.bot.cursor.json'));
+    if (!files.length) { dbg('loadContextToken: 无 cursor 文件'); return ''; }
+    const target = files
+      .map((f) => ({ f, m: fs.statSync(path.join(CLAW_STATE_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m)[0].f;
+    const j = JSON.parse(fs.readFileSync(path.join(CLAW_STATE_DIR, target), 'utf-8'));
+    const buf = j.get_updates_buf || '';
+    dbg('loadContextToken: 来源', target, 'buf长度', buf.length);
+    return buf;
+  } catch (e) {
+    dbg('loadContextToken 失败:', e.message);
+    return '';
+  }
+}
+
 // ── 底层 POST ────────────────────────────────────────────
 async function ilinkPost(channel, endpoint, body, timeout = 15000) {
-  const base = channel.baseUrl.endsWith('/') ? channel.baseUrl : channel.baseUrl + '/';
-  const url = new URL(endpoint, base).toString();
+  const base = channel.baseUrl || 'https://ilinkai.weixin.qq.com';
+  const url = new URL(endpoint, base.endsWith('/') ? base : base + '/').toString();
   body.base_info = buildBaseInfo();
   const res = await fetch(url, {
     method: 'POST',
@@ -152,34 +163,13 @@ async function ilinkPost(channel, endpoint, body, timeout = 15000) {
     signal: AbortSignal.timeout(timeout),
   });
   const raw = await res.text();
-  log(`POST ${endpoint} -> ${res.status}`, VERBOSE ? raw : '');
+  dbg(`POST ${endpoint} -> ${res.status}`, VERBOSE ? raw : '');
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${raw}`);
   let json = {};
   try { json = JSON.parse(raw); } catch { /* 空响应 = 成功 */ }
   if (json && json.ret && json.ret !== 0) throw new Error(`API ret=${json.ret} errmsg=${json.errmsg}`);
   if (json && json.errcode && json.errcode !== 0) throw new Error(`API errcode=${json.errcode} errmsg=${json.errmsg}`);
   return json;
-}
-
-// ── getUpdates：捕获老板消息里的 context_token ───────────
-async function captureContextToken(channel, timeoutMs) {
-  const base = channel.baseUrl.endsWith('/') ? channel.baseUrl : channel.baseUrl + '/';
-  const url = new URL('ilink/bot/getupdates', base).toString();
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: buildHeaders(channel.botToken),
-    body: JSON.stringify({ get_updates_buf: '', base_info: buildBaseInfo() }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const raw = await res.text();
-  log('getupdates ->', res.status, VERBOSE ? raw : '');
-  let json = {};
-  try { json = JSON.parse(raw); } catch { /* timeout empty */ }
-  const msgs = (json && json.msgs) || [];
-  for (const m of msgs) {
-    if (m.context_token) { saveContextToken(m.context_token); return m.context_token; }
-  }
-  return null;
 }
 
 // ── 发送文本（自动分片）──────────────────────────────────
@@ -200,6 +190,7 @@ async function sendText(channel, to, text, ctx) {
 
 // ── 媒体上传（CDN + AES-128-ECB）────────────────────────
 async function uploadMedia(channel, filePath, to, mediaType) {
+  if (!fs.existsSync(filePath)) throw new Error(`文件不存在: ${filePath}`);
   const aesKey = crypto.randomBytes(16);
   const aesKeyHex = aesKey.toString('hex');
   let raw = fs.readFileSync(filePath);
@@ -209,7 +200,7 @@ async function uploadMedia(channel, filePath, to, mediaType) {
     if (['.txt', '.md', '.csv', '.log', '.json', '.xml', '.yml', '.yaml', '.text'].includes(ext)) {
       if (raw.length < 3 || raw[0] !== 0xEF || raw[1] !== 0xBB || raw[2] !== 0xBF) {
         raw = Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), raw]);
-        log('preset UTF-8 BOM for text file');
+        dbg('preset UTF-8 BOM for text file');
       }
     }
   }
@@ -217,14 +208,14 @@ async function uploadMedia(channel, filePath, to, mediaType) {
   const rawMd5 = md5Hex(raw);
   const cipher = aesEcbEncrypt(raw, aesKey);
   const cipherSize = cipher.length;
-  const filekey = aesKey.toString('hex');
+  const filekey = aesKeyHex;
 
   const resp = await ilinkPost(channel, 'ilink/bot/getuploadurl', {
     filekey, media_type: mediaType, to_user_id: to,
     rawsize: rawSize, rawfilemd5: rawMd5, filesize: cipherSize,
     no_need_thumb: true, aeskey: aesKeyHex,
   }, 20000);
-  log('getuploadurl resp keys=', Object.keys(resp));
+  dbg('getuploadurl resp keys=', Object.keys(resp));
 
   const uploadFullUrl = (resp.upload_full_url || '').trim();
   const uploadParam = resp.upload_param;
@@ -239,7 +230,7 @@ async function uploadMedia(channel, filePath, to, mediaType) {
     body: new Uint8Array(cipher),
     signal: AbortSignal.timeout(120000),
   });
-  log('CDN upload ->', cdnRes.status);
+  dbg('CDN upload ->', cdnRes.status);
   if (cdnRes.status >= 400 && cdnRes.status < 500) {
     const msg = cdnRes.headers.get('x-error-message') || (await cdnRes.text().catch(() => ''));
     throw new Error(`CDN 上传客户端错误 ${cdnRes.status}: ${msg}`);
@@ -288,18 +279,7 @@ async function sendMediaItems(channel, to, items, ctx, label) {
       msg: { from_user_id: '', to_user_id: to, client_id: last, message_type: 2, message_state: 2, item_list: [item], context_token: ctx },
     });
   }
-  log(label, 'sent', items.length, 'items');
-}
-
-// ── 为媒体获取 context_token（--context > 已存 > 捕获）────
-async function resolveMediaToken(channel, explicitCtx) {
-  if (explicitCtx) return explicitCtx;
-  const saved = loadContextToken();
-  if (saved) { log('using saved context_token'); return saved; }
-  console.error('[weixinclaw] 无已存 context_token，正在长轮询等待老板发消息以捕获（120s）...');
-  const captured = await captureContextToken(channel, 120000);
-  if (captured) { console.error('[weixinclaw] 已捕获并保存 context_token'); return captured; }
-  throw new Error('未获取到 context_token：主动推送前，请先在微信给 bot 发任意一条消息（bootstrap），或在命令加 --context <token>');
+  dbg(label, 'sent', items.length, 'items');
 }
 
 // ── main ─────────────────────────────────────────────────
@@ -309,31 +289,21 @@ async function resolveMediaToken(channel, explicitCtx) {
   if (!fs.existsSync(SETTINGS_PATH)) throw new Error(`settings.json not found at ${SETTINGS_PATH}`);
   const cfg = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8'));
   const channel = findWeixinClawBot(cfg);
+  if (!channel.botToken) throw new Error('settings.json 中 weixinClawBot 缺少 botToken');
+  if (!channel.userId) throw new Error('settings.json 中 weixinClawBot 缺少 userId（老板的 im.wechat id）');
   const to = channel.userId;
 
-  // 仅捕获 token 模式（常驻守护：持续监听老板消息，自动落盘，永不退出）
-  // 用法：node send.js --capture-token   （建议以后台常驻方式运行）
-  if (a.captureToken) {
-    console.error('[weixinclaw] 常驻捕获模式：持续监听老板微信消息，自动保存 context_token（Ctrl+C 退出）');
-    let attempt = 0;
-    while (true) {
-      attempt++;
-      try {
-        console.error(`[weixinclaw] 第 ${attempt} 次长轮询...`);
-        const tok = await captureContextToken(channel, 60000);
-        if (tok) console.error(`[weixinclaw] 捕获成功并保存（前20位: ${tok.slice(0, 20)}...），继续监听以保持 token 新鲜`);
-      } catch (e) {
-        console.error(`[weixinclaw] 轮询出错，${e.message} — 2s 后重试`);
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-    }
-    return;
+  // ctx 优先级：--context 显式 ＞ 读 cursor get_updates_buf（不采用空 token，不够通用）
+  let ctxSrc = a.context ? 'override' : '';
+  let ctx = a.context || '';
+  if (!ctx) { ctx = loadContextToken(); if (ctx) ctxSrc = 'cursor_buf'; }
+  if (!ctx) {
+    console.error('[weixinclaw] ⚠️ 未取得 context_token：claw-state/weixin 下无有效 cursor buf。');
+    console.error('[weixinclaw]   请让老板先在微信给 ClawBot 发一条消息触发 host 刷新游标，或用 --context <token> 显式传入。');
+    process.exit(2);
   }
-
-  console.log(`[weixinclaw] channel=${channel.name} to=${to} mode=${a.context ? 'reply' : 'proactive'} appid=${ILINK_APP_ID} cver=${CLIENT_VERSION} chver=${CHANNEL_VERSION}`);
-
-  // 所有模式都需有效 context_token（文本/媒体均强制，实测空 token => ret:-2）
-  const ctx = a.context || await resolveMediaToken(channel, '');
+  // ⚠️ 只打印长度，绝不打印 token 明文
+  console.log(`[weixinclaw] channel=${channel.name} to=${to} mode=proactive appid=${ILINK_APP_ID} cver=${CLIENT_VERSION} chver=${CHANNEL_VERSION} ctx_src=${ctxSrc} ctx_len=${ctx.length}`);
 
   let n = 0;
   if (a.image) {
