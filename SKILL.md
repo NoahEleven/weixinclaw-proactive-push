@@ -38,7 +38,7 @@ WorkBuddy 迁移自 OpenClaw。微信主动推送能力其实**一直活着**，
 
 ```bash
 NODE="C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2/node.exe"   # 将 <USER> 换成你的 Windows 用户名
-SKILL="C:/Users/<USER>/.workbuddy/skills/weixinclaw-proactive-push"         # 或进入本 skill 目录后改用相对路径
+SKILL="C:/Users/<USER>/.workbuddy/skills/weixinclaw-proactive-push/send.js"  # ⚠️ 必须指到 send.js；只传目录会 MODULE_NOT_FOUND（无 package.json main）
 
 # 文本（context_token 自动从 cursor 游标读取，详见下方机制专节）
 "$NODE" "$SKILL" "🦐 你的消息内容"
@@ -85,37 +85,62 @@ claw/users/<uid>/channels/weixinClawBot = {
 - 文本 / 图片 / 文件 / 视频**均适用**，没有"空 token 可推"的类型。
 - 唯一正确来源是 cursor 游标里的 `get_updates_buf`（见下），不要传空。
 
-### context_token 的唯一来源：cursor 游标里的 `get_updates_buf`（≈1 天有效）
+### context_token 的唯一来源：cursor 游标里的 `get_updates_buf`
 
 > ❌ 不采用「空 context_token」：它仅在你刚给 ClawBot 发过消息后的极短窗口内才被服务端放行，
 > 通用性差、不可预期，**已明确弃用**。一律走下方 cursor 方案。
 
 - host 实时把 ilink 接收会话游标写进
-  `~/.workbuddy/claw-state/weixin/<accountId>_im.bot.cursor.json` 的 `get_updates_buf` 字段。
+  `~/.workbuddy/claw-state/weixin/<ACCOUNT_ID>_im.bot.cursor.json` 的 `get_updates_buf` 字段。
 - 该字段值是 **base64 编码的 protobuf**；我们**把整段 base64 串原样**当作 `context_token` 用
   （不是解码出来的 botToken 串，也不是里面的 accountId 段）。
-- **有效期 ≈ 1 天**，随内嵌的 accountId（形如 `<accountId>`）滚动而变 →
-  过期后 host 自动刷新，重读文件即得新 buf。
-- 实测：buf 当 `context_token` + `botToken` 当 Bearer ⇒ `{}` 成功，且**不依赖** codebuddy.js 注入、
-  不读 context-token.json、无需轮询、无需你发消息。
+
+> ✅❌ **读取铁律（违反任何一条都会 ret:-2，这是"编码读取方式"的要害）**
+> 1. **以 UTF-8 文本**读 `cursor.json` → ② `JSON.parse` → ③ 取 `get_updates_buf` 字段的【字符串值】 →
+>    ④ **原样**作为 `context_token`。
+> 2. ❌ 严禁对这串做任何变换：**base64 解码、重新编码、trim、URL-decode、转义、换行、截断、大小写改写**。
+>    base64 串里全是 `A-Za-z0-9+/=` 字符，JSON 安全，**直接原样塞进 `context_token` 字段即可**。
+> 3. ❌ 不要"聪明地"解析 / 改写 / 重组这个串——它就是个不透明令牌，服务端的校验逻辑你是看不见的，任何本地变换都只会让它失效。
+> 4. ✅ 直接用本仓库的 `send.js`（已封装以上全部），**不要手工拼请求**——手工拼最容易在读取这步翻车。
+
+- **凭证稳定、不要误判**：`botToken` / `accountId` 段（形如 `<ACCOUNT_ID>`）约 **1 天**才轮换一次，期间**一直有效、不变是正常的**，它**不是**失效信号，别拿它判断 buf 是否过期。
+- **唯一真正的刷新动作 = 发消息激活**：当推送被拒（`ret:-2`）时，**必须**先让老板/用户自己在微信给 ClawBot 发一条消息，host 随即刷新游标、脚本下次运行自动读到最新 buf 即可重发。**不需要**等 buf「值」变化、不需要比对 mtime、不需要轮询。
+- ⚠️ **未激活时反复直接重跑必定再次 `ret:-2`**——请务必先完成"发消息激活"这个动作，再重跑命令。
+- 实测：buf 当 `context_token` + 完整 `botToken` 当 Bearer ⇒ `{}` 成功，且不读 context-token.json、无需轮询。
 - 编码细节：`get_updates_buf` 解码后为约 78 字节 protobuf，含 `botId`(varint) + 账号标识 +
   botToken 明文段（`accountId@im.bot:secret`）。
 
 > 🔒 `get_updates_buf` 内嵌了 bot 凭证副本，**绝不要**把它粘贴到聊天、Issue、或随仓库提交。
 
+### `im.bot.cursor.json` 文件的更新机制（务必分清"文件刷新"和"buf 轮换"两件事）
+
+文件路径：`~/.workbuddy/claw-state/weixin/<ACCOUNT_ID>_im.bot.cursor.json`
+（`<ACCOUNT_ID>` = bot accountId 段，如同一个 bot 换了凭证/会话，文件名的这段会变，会出现新的一份 cursor 文件）。
+
+**① 文件何时被创建**
+- 该文件由 host（WorkBuddy 后台的 ilink bot 长轮询）维护。**通道必须先建立过会话**才会有这个文件——
+  即老板/用户曾在微信给 ClawBot 发过消息、host 侧建立了接收游标。
+- 若目录里没有任何 `*_im.bot.cursor.json`：让老板/用户**先在微信给 ClawBot 发一条消息**，host 才会写出该文件。
+
+**② 文件 mtime（修改时间）——host 实时刷新，别拿它当判断依据**
+- host 在**每一轮长轮询写盘游标**时都会更新该文件的 mtime，非常频繁，且**与你是否发消息无关**（是 host 侧实时行为，不是你触发的）。
+- ⚠️ 因此 **绝不能用 mtime（"多久没变 / 刚变过"）来判断 buf 是否新鲜、是否需要刷新**——mtime 一直在变，但 `get_updates_buf` 的值**未必**跟着变。这是最容易误判的点。
+
+**③ `get_updates_buf` 内容（真正的 token）——稳定，靠"激活"刷新，不靠时间猜**
+- 这才是我们要的 token。它在 bot 凭证/会话有效期内**保持稳定**（`accountId` 段约 1 天轮换一次，期间不变属正常）。
+- 判断是否需要刷新，**唯一依据是「实际推送是否被服务端拒绝（`ret:-2`）」**：
+  - 被拒＝当前 buf 暂时不可发送 → **先让老板/用户在微信给 ClawBot 发一条消息激活**（host 随即刷新游标），再重跑 `send.js` 自动读最新 buf 重发即可。
+  - ⚠️ **不要**把 mtime 变化、或"buf 值有没有变"当成判断条件——这两者都不决定可发送性，纯属干扰。
+- `send.js` 收到 `-2` 会【清晰报错并退出】，不内置轮询等待（"等待刷新"退步逻辑已彻底删除）；由你手动激活后重跑命令即可。
+
 ### send.js 的取值优先级
 ```
 ctx = --context 显式传入
-    ＞ 读最新 <accountId>_im.bot.cursor.json 的 get_updates_buf （默认走这条，≈1 天有效）
+    ＞ 读最新 <ACCOUNT_ID>_im.bot.cursor.json 的 get_updates_buf （默认走这条）
 ```
-（`get_updates_buf` 为空或很久没刷新时，让老板在微信给 ClawBot 发一条消息触发 host 刷新游标即可；
-极端情况再走 `--context <token>` 显式兜底，不要依赖空 token。）
-
-### 无需 host 注入 / 无需 context-token.json
-- `codebuddy.js` 里的 `PERSIST_TOKEN_V2` 注入（写 context-token.json）**已于 2026-07-09 还原剥离**，
-  对主动推送无影响。
-- 推送只依赖：① settings.json 的 `botToken`（Bearer）+ `userId`（to_user_id）；
-  ② cursor 文件的 `get_updates_buf`（当 context_token）。两者都是 host 原生维护，不靠任何 hack。
+（`get_updates_buf` 为空、或推送被拒 `ret:-2` 时：
+**先让老板/用户自己在微信给 ClawBot 发一条消息激活**（host 随即刷新游标），再重跑 `send.js` 自动读最新 cursor 文件；
+仍失败再走 `--context <token>` 显式兜底，不要依赖空 token。）
 
 ## 🔴 关键坑（必看，否则必失败）
 1. **Bearer token 必须用完整 `botToken` 串**（含 `accountId:` 前缀），即
@@ -170,7 +195,7 @@ ctx = --context 显式传入
 | 现象 | 原因 | 解决 |
 |------|------|------|
 | `errcode:-14 session timeout` | 用了短 token | 改用完整 `botToken` 串 |
-| `FAILED: API ret=-2` | 缺有效 `context_token`（文本/媒体都适用） | 默认读 cursor 的 `get_updates_buf` 当 ctx（≈1天有效）；若该 buf 为空/过期，让老板在微信给 ClawBot 发一条消息触发 host 刷新游标，或显式 `--context <token>` 兜底 |
+| `FAILED: API ret=-2` | `context_token` 未被激活、当前不可发送（文本/媒体都适用） | **【必须】先到微信给 ClawBot 发一条任意消息**（激活 host 的发送游标），**激活后再重跑本命令**，`send.js` 自动读最新 buf 重发。⚠️ 未激活时反复直接重跑必定再次 `ret:-2`，请务必先完成激活动作；不要拿 mtime 或"buf 值变没变"当判断条件；`send.js` 收到 `-2` 会清晰报错并退出（不内置轮询）；仍失败再显式 `--context <token>` 兜底 |
 | 网络超时 / fetch 失败 | 默认沙箱拦截出网 | 加 `dangerouslyDisableSandbox: true` 或点允许 |
 | 通道找不到 | settings.json 路径/字段变了 | 按上文"凭据从哪来"手动核对路径 |
 | 走错通道 | 误用 MCP 的 weixin/wecom | 确认用 `weixinClawBot`（ClawBot），不是 MCP connector |
