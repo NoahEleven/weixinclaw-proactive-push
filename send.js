@@ -13,13 +13,15 @@
  *   - 所有凭据均从本机配置文件现读，不依赖任何硬编码或外部传入的密钥。
  *   - ⚠️ claw-state/weixin/ 的 cursor 文件内嵌 bot 凭证镜像，切勿将其纳入分享 / 备份 / 提交。
  *
- * 【context_token 读取铁律】
- *   - 唯一正确来源：claw-state/weixin 下 <ACCOUNT_ID>_im.bot.cursor.json 的 get_updates_buf。
- *   - 该字段是一个【base64 字符串】，用法极其严格：
+ * 【context_token 策略 — 文本默认空，媒体才取 cursor buf】
+ *   - 文本推送：context_token 默认【空串】即可发送，无需读 cursor、无需激活。
+ *       这也是为什么会话闲置十几小时后文本仍能推送——空 token 对文本长期有效。
+ *   - 媒体推送（图片/文件/视频）：【必须】带非空 context_token，
+ *       唯一来源 = claw-state/weixin 下 <ACCOUNT_ID>_im.bot.cursor.json 的 get_updates_buf。
+ *   - get_updates_buf 是一个【base64 字符串】，用法极其严格：
  *       UTF-8 读 JSON → JSON.parse → 取 get_updates_buf 字段的【字符串原值】→ 原样当作 context_token 发出。
  *   - ❌ 严禁任何变换：base64 解码、重新编码、trim、URL-decode、转义、换行、截断。
  *       只要对原串做一步变换，服务端必返回 ret:-2。
- *   - ❌ 不采用「空 context_token」：它仅在你刚发过消息后的极短窗口才被放行，不够通用，已弃用。
  *   - 全程不读 context-token.json、不依赖任何 host 注入 hack。
  *
  * 【文件精确匹配，不靠 mtime 猜】
@@ -37,16 +39,17 @@
  *   - msg.client_id: "cbc-<时间戳>-<随机>"（必须带 cbc- 前缀，非裸 uuid）。
  *   - msg.context_token: 上面的 get_updates_buf 原串。
  *
- * 【失败处理 — 不自动退避/重发，只有 ret:-2 时才需用户重新激活】
+ * 【失败处理 — 不自动退避/重发，被拒即要求用户激活】
  *   - 本脚本只发一次。ret:-2 等错误会【直接、清晰地】报出来并以 exit 1 退出，
  *     不做任何 sleep / 轮询 / 等待激活 / 自动重试。
  *   - 若被拒（ret:-2）：【必须】先让老板/用户在微信给 ClawBot 发一条消息，
  *     激活 host 的发送游标，然后【手动重新运行】本命令；脚本不阻塞等待。
- *   - 重要：激活一次后会话通常可维持较长时间（实测跨 10+ 小时仍能推送），
- *     只要没有 ret:-2 就不需要每次推送前都发消息。
+ *   - ⚠️ 文本推送平时用空 context_token 即可长期发送；一旦文本也被拒（ret:-2），
+ *     大概率是底层 bot id / 凭证已轮换，【同样需要】发消息激活后重跑。
+ *   - 媒体推送依赖 cursor buf，被拒同理：先激活刷新游标，再重跑。
  *
  * 用法:
- *   node send.js "文本消息"                                  # 主动推文本（自动用 cursor buf 当 ctx）
+ *   node send.js "文本消息"                                  # 主动推文本（默认空 context_token，无需激活）
  *   node send.js --text-file 内容.txt
  *   node send.js --image 截图.png --caption "看这张图"
  *   node send.js --file 报告.pdf --name "周报.pdf" --caption "请查阅"
@@ -318,18 +321,25 @@ async function sendMediaItems(channel, to, items, ctx, label) {
   if (!channel.userId) throw new Error('settings.json 中 weixinClawBot 缺少 userId（老板的 im.wechat id）');
   const to = channel.userId;
 
-  // ctx 优先级：--context 显式 ＞ 读 cursor get_updates_buf（不采用空 token，不够通用）
+  // ── context_token 策略 ─────────────────────────────────
+  // 文本：默认【空串】即可发送（无需 cursor、无需激活）。
+  // 媒体（图片/文件/视频）：【必须】带非空 token → 从 cursor 读 get_updates_buf。
+  // --context 显式传入 → 任何类型都优先用它覆盖。
+  const isMedia = !!(a.image || a.video || a.file);
   const explicitCtx = !!a.context;
   let ctx = a.context || '';
-  if (!ctx) { ctx = loadContextToken(channel); }
-  if (!ctx) {
-    console.error('[weixinclaw] ⚠️ 未取得 context_token：claw-state/weixin 下无有效 cursor buf。');
-    console.error('[weixinclaw] 【必须】请先到微信给 ClawBot 发一条消息，host 才会写出/刷新游标文件，');
-    console.error('[weixinclaw]        激活后再重跑本命令即可；或用 --context <token> 显式传入已知有效的 token。');
-    process.exit(2);
+  const ctxSrc = explicitCtx ? 'override' : (isMedia ? 'cursor_buf' : 'empty');
+  if (!ctx && isMedia) {
+    ctx = loadContextToken(channel);
+    if (!ctx) {
+      console.error('[weixinclaw] ⚠️ 媒体推送需要非空 context_token，但 claw-state/weixin 下无有效 cursor buf。');
+      console.error('[weixinclaw] 【必须】请先到微信给 ClawBot 发一条消息激活（host 才会写出/刷新游标），');
+      console.error('[weixinclaw]        激活后再重跑本命令即可；或用 --context <token> 显式传入已知有效的 token。');
+      process.exit(2);
+    }
   }
   // ⚠️ 只打印长度，绝不打印 token 明文
-  console.log(`[weixinclaw] channel=${channel.name} to=${to} mode=proactive ctx_src=${explicitCtx ? 'override' : 'cursor_buf'} ctx_len=${ctx.length}`);
+  console.log(`[weixinclaw] channel=${channel.name} to=${to} mode=proactive ctx_src=${ctxSrc} ctx_len=${ctx.length}`);
 
   let n = 0;
   let label = '';
@@ -354,10 +364,10 @@ async function sendMediaItems(channel, to, items, ctx, label) {
   console.error('[weixinclaw] FAILED:', e.message);
   if (isCtx) {
     console.error('');
-    console.error('[weixinclaw] ⚠️ 推送被拒（ret:-2）：当前会话未激活/已失效，不可发送。');
+    console.error('[weixinclaw] ⚠️ 推送被拒（ret:-2）：会话已失效 / 底层 bot id 已轮换，不可发送。');
+    console.error('[weixinclaw]    （文本平时用空 token 即可；一旦文本也被拒，大概率是 bot id 变了，同样需激活。）');
     console.error('[weixinclaw] 【必须】请先到微信，给 ClawBot 发一条任意消息（激活 host 的发送游标），');
     console.error('[weixinclaw]         激活后再重跑本命令即可，send.js 会自动读取刷新后的最新 buf。');
-    console.error('[weixinclaw] ⚠️ 未激活时反复直接重跑必定再次 ret:-2；若此前刚激活过，可维持较长时间有效。');
   }
   process.exit(1);
 });
