@@ -37,12 +37,13 @@
  *   - msg.client_id: "cbc-<时间戳>-<随机>"（必须带 cbc- 前缀，非裸 uuid）。
  *   - msg.context_token: 上面的 get_updates_buf 原串。
  *
- * 【失败处理 — 不自动退避/重发，失败即要求用户重新激活】
+ * 【失败处理 — 不自动退避/重发，只有 ret:-2 时才需用户重新激活】
  *   - 本脚本只发一次。ret:-2 等错误会【直接、清晰地】报出来并以 exit 1 退出，
  *     不做任何 sleep / 轮询 / 等待激活 / 自动重试。
  *   - 若被拒（ret:-2）：【必须】先让老板/用户在微信给 ClawBot 发一条消息，
  *     激活 host 的发送游标，然后【手动重新运行】本命令；脚本不阻塞等待。
- *   - ⚠️ 未激活时反复直接重跑必定再次 ret:-2，请务必先完成"发消息激活"动作再重跑。
+ *   - 重要：激活一次后会话通常可维持较长时间（实测跨 10+ 小时仍能推送），
+ *     只要没有 ret:-2 就不需要每次推送前都发消息。
  *
  * 用法:
  *   node send.js "文本消息"                                  # 主动推文本（自动用 cursor buf 当 ctx）
@@ -353,10 +354,10 @@ async function sendMediaItems(channel, to, items, ctx, label) {
   console.error('[weixinclaw] FAILED:', e.message);
   if (isCtx) {
     console.error('');
-    console.error('[weixinclaw] ⚠️ 推送被拒（ret:-2）：当前 context_token 未被激活，不可发送。');
+    console.error('[weixinclaw] ⚠️ 推送被拒（ret:-2）：当前会话未激活/已失效，不可发送。');
     console.error('[weixinclaw] 【必须】请先到微信，给 ClawBot 发一条任意消息（激活 host 的发送游标），');
     console.error('[weixinclaw]         激活后再重跑本命令即可，send.js 会自动读取刷新后的最新 buf。');
-    console.error('[weixinclaw] ⚠️ 不要反复直接重跑——未激活时重跑必定再次 ret:-2。');
+    console.error('[weixinclaw] ⚠️ 未激活时反复直接重跑必定再次 ret:-2；若此前刚激活过，可维持较长时间有效。');
   }
   process.exit(1);
 });
