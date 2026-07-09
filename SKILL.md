@@ -28,7 +28,7 @@ WorkBuddy 迁移自 OpenClaw。微信主动推送能力其实**一直活着**，
 > ⚠️ `openclaw-weixin-cli` 不需要装（那是 OpenClaw 的通道安装器，对 WorkBuddy 无用）。
 
 ## 何时用
-- "通过 ClawBot 主动推一条消息给老板"（context_token 自动从 cursor 游标读取，详见下方机制专节）
+- "通过 ClawBot 主动推一条消息给老板"（文本默认空 context_token，无需激活；详见下方机制专节）
 - "微信主动推送测试""给老板发条微信 bot 消息"
 - "发张图/发个文件/发段视频给老板"（context_token 自动读取，详见机制专节）
 - 定时任务把结果主动推到老板微信（ClawBot bot 消息，非对话气泡）
@@ -40,7 +40,7 @@ WorkBuddy 迁移自 OpenClaw。微信主动推送能力其实**一直活着**，
 NODE="C:/Users/<USER>/.workbuddy/binaries/node/versions/22.22.2/node.exe"   # 将 <USER> 换成你的 Windows 用户名
 SKILL="C:/Users/<USER>/.workbuddy/skills/weixinclaw-proactive-push/send.js"  # ⚠️ 必须指到 send.js；只传目录会 MODULE_NOT_FOUND（无 package.json main）
 
-# 文本（context_token 自动从 cursor 游标读取，详见下方机制专节）
+# 文本（默认空 context_token，无需激活；详见下方机制专节）
 "$NODE" "$SKILL" "🦐 你的消息内容"
 
 # 从文件读长文本
@@ -80,15 +80,15 @@ claw/users/<uid>/channels/weixinClawBot = {
 
 ## 🔴 关键机制：context_token（2026-07-09 定稿）
 
-### 文本 / 媒体都强制要求 context_token
-- 实测：`ilink/bot/sendmessage` 的 `msg.context_token` 传空串 ⇒ `ret:-2` 拒收；省略该字段同样 `-2`。
-- 文本 / 图片 / 文件 / 视频**均适用**，没有"空 token 可推"的类型。
-- 唯一正确来源是 cursor 游标里的 `get_updates_buf`（见下），不要传空。
+### 文本默认空 token；只有媒体才带 cursor buf
+- **文本推送**：`msg.context_token` 默认传【空串】即可发送，**无需读 cursor、无需激活**。
+  这就是为什么会话闲置十几小时（例如昨晚到今早）文本仍能正常推送——空 token 对文本长期有效。
+- **媒体推送（图片 / 文件 / 视频）**：**必须**带非空 `context_token`，
+  唯一来源是 cursor 游标里的 `get_updates_buf`（见下）。空 token 发媒体会 `ret:-2`。
+- **任何被拒（`ret:-2`）都要激活**：文本平时用空 token 就能发，一旦**文本也被拒**，
+  大概率是底层 bot id / 凭证已轮换，**同样需要**先给 ClawBot 发消息激活后重跑（详见排错表）。
 
-### context_token 的唯一来源：cursor 游标里的 `get_updates_buf`
-
-> ❌ 不采用「空 context_token」：它仅在你刚给 ClawBot 发过消息后的极短窗口内才被服务端放行，
-> 通用性差、不可预期，**已明确弃用**。一律走下方 cursor 方案。
+### 媒体的 context_token 来源：cursor 游标里的 `get_updates_buf`
 
 - host 实时把 ilink 接收会话游标写进
   `~/.workbuddy/claw-state/weixin/<ACCOUNT_ID>_im.bot.cursor.json` 的 `get_updates_buf` 字段。
@@ -104,9 +104,11 @@ claw/users/<uid>/channels/weixinClawBot = {
 > 4. ✅ 直接用本仓库的 `send.js`（已封装以上全部），**不要手工拼请求**——手工拼最容易在读取这步翻车。
 
 - **凭证稳定、不要误判**：`botToken` / `accountId` 段（形如 `<ACCOUNT_ID>`）约 **1 天**才轮换一次，期间**一直有效、不变是正常的**，它**不是**失效信号，别拿它判断 buf 是否过期。
-- **会话激活一次，可长期使用**：只要此前已激活过且没有收到 `ret:-2`，就可以持续用当前 cursor buf 推送（实测跨 13 小时以上仍能成功），**不需要每次推送前都重新发消息**。唯一需要重新激活的时刻就是实际被拒（`ret:-2`）。
+- **文本无需激活**：文本走空 token，会话闲置多久都能发（实测跨十几小时）；只有出现 `ret:-2` 时才需激活。
+- **媒体激活一次可长期使用**：媒体带 cursor buf，只要此前已激活过且没收到 `ret:-2`，就可持续推送，**不需要每次推送前都重新发消息**。
+- **文本被拒 = id 变了，也要激活**：文本平时空 token 能发；一旦文本 `ret:-2`，大概率底层 bot id 轮换，**同样**先发消息激活再重跑。
 - ⚠️ **未激活时反复直接重跑必定再次 `ret:-2`**——请务必先完成"发消息激活"这个动作，再重跑命令。
-- 实测：buf 当 `context_token` + 完整 `botToken` 当 Bearer ⇒ `{}` 成功，且不读 context-token.json、无需轮询。
+- 实测：媒体用 buf 当 `context_token` + 完整 `botToken` 当 Bearer ⇒ `{}` 成功，且不读 context-token.json、无需轮询。
 - 编码细节：`get_updates_buf` 解码后为约 78 字节 protobuf，含 `botId`(varint) + 账号标识 +
   botToken 明文段（`accountId@im.bot:secret`）。
 
@@ -136,12 +138,12 @@ claw/users/<uid>/channels/weixinClawBot = {
 
 ### send.js 的取值优先级
 ```
-ctx = --context 显式传入
-    ＞ 读最新 <ACCOUNT_ID>_im.bot.cursor.json 的 get_updates_buf （默认走这条）
+文本：ctx = --context 显式传入 ＞ 【空串】（默认，无需 cursor / 激活）
+媒体：ctx = --context 显式传入 ＞ 读最新 <ACCOUNT_ID>_im.bot.cursor.json 的 get_updates_buf（默认走这条）
 ```
-（`get_updates_buf` 为空、或推送被拒 `ret:-2` 时：
-**先让老板/用户自己在微信给 ClawBot 发一条消息激活**（host 随即刷新游标），再重跑 `send.js` 自动读最新 cursor 文件；
-仍失败再走 `--context <token>` 显式兜底，不要依赖空 token。）
+（媒体的 `get_updates_buf` 为空、或任何推送被拒 `ret:-2`（含文本被拒＝id 变了）时：
+**先让老板/用户自己在微信给 ClawBot 发一条消息激活**（host 随即刷新游标），再重跑 `send.js`；
+仍失败再走 `--context <token>` 显式兜底。）
 
 ## 🔴 关键坑（必看，否则必失败）
 1. **Bearer token 必须用完整 `botToken` 串**（含 `accountId:` 前缀），即
@@ -151,7 +153,7 @@ ctx = --context 显式传入
    - `channel_version = "2.4.6"`（早期实现误用 `cbc-1.0.0`，现已对齐官方）
    - `iLink-App-ClientVersion = 132102`（= `buildClientVersion("2.4.6")`）
    - `iLink-App-Id = "bot"`，`bot_agent = "OpenClaw"`
-3. **媒体推送必须带有效 `context_token`**（见上节），否则 `ret:-2` 拒收。
+3. **文本默认空 `context_token` 即可**；**媒体推送必须带有效 `context_token`**（见上节），否则 `ret:-2` 拒收。文本若也被拒 `ret:-2`，大概率 bot id 轮换，需激活。
 
 ## 发送契约（对齐官方 ilink bot 协议）
 - 端点：`POST {baseUrl}/ilink/bot/sendmessage`
@@ -196,7 +198,7 @@ ctx = --context 显式传入
 | 现象 | 原因 | 解决 |
 |------|------|------|
 | `errcode:-14 session timeout` | 用了短 token | 改用完整 `botToken` 串 |
-| `FAILED: API ret=-2` | `context_token` 对应的会话已失效，当前不可发送（文本/媒体都适用；激活一次通常可维持较长时间，只有出现 `-2` 才需重新激活） | **【必须】先到微信给 ClawBot 发一条任意消息**（激活 host 的发送游标），**激活后再重跑本命令**，`send.js` 自动读最新 buf 重发。⚠️ 未激活时反复直接重跑必定再次 `ret:-2`，请务必先完成激活动作；不要拿 mtime 或"buf 值变没变"当判断条件；`send.js` 收到 `-2` 会清晰报错并退出（不内置轮询）；仍失败再显式 `--context <token>` 兜底 |
+| `FAILED: API ret=-2` | 会话已失效 / 底层 bot id 已轮换。文本平时用空 token 可长期发送，一旦文本也 `-2` 大概率是 id 变了；媒体则是 cursor buf 失效 | **【必须】先到微信给 ClawBot 发一条任意消息**（激活 host 的发送游标），**激活后再重跑本命令**，`send.js` 自动读最新 buf 重发。⚠️ 未激活时反复直接重跑必定再次 `ret:-2`，请务必先完成激活动作；不要拿 mtime 或"buf 值变没变"当判断条件；`send.js` 收到 `-2` 会清晰报错并退出（不内置轮询）；仍失败再显式 `--context <token>` 兜底 |
 | 网络超时 / fetch 失败 | 默认沙箱拦截出网 | 加 `dangerouslyDisableSandbox: true` 或点允许 |
 | 通道找不到 | settings.json 路径/字段变了 | 按上文"凭据从哪来"手动核对路径 |
 | 走错通道 | 误用 MCP 的 weixin/wecom | 确认用 `weixinClawBot`（ClawBot），不是 MCP connector |
