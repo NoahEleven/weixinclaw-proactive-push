@@ -3,6 +3,8 @@ name: weixinclaw-proactive-push
 description: 通过 WorkBuddy 已连接的 ClawBot 微信 bot 通道（weixinClawBot / ilink bot，非微信客服号）主动向老板微信推送文本/图片/文件/视频。当用户要求"通过 ClawBot 主动推送/给老板发微信/微信主动推送测试/微信独立消息/发图片给老板/发文件给老板"时使用。协议严格对齐腾讯官方插件 @tencent-weixin/openclaw-weixin@2.4.6（src/api + src/messaging + src/cdn）。
 ---
 
+> 📦 **本 skill 源码仓库**：https://github.com/NoahEleven/weixinclaw-proactive-push （公开，欢迎 clone / 提 Issue）
+
 # 微信(ClawBot)主动推送（weixinClawBot / ilink bot）
 
 ## 背景
